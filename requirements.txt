@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+
+litellm
+
+python-dotenv
+
+sentence-transformers
+chromadb
+pypdf
+
+numpy
+
+rich
+
