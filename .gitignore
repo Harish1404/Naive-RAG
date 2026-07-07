@@ -1,3 +1,4 @@
 .env
 chroma_db/
-
+venv/
+CLAUDE.md
