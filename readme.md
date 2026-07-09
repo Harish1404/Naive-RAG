@@ -2,6 +2,11 @@
 
 This document provides a comprehensive overview of the Retrieval-Augmented Generation (RAG) implementation within this repository. 
 
+## Documentation & Visual Diagrams
+- [System Architecture](docs/architecture.md)
+- [RAG Workflows](docs/workflow.md)
+- [Chunking Strategy](docs/chunking.md)
+
 ## 1. Core Architecture
 
 The RAG system is built in Python and adopts a modular architecture to separate data ingestion, embedding generation, vector storage, and orchestration.

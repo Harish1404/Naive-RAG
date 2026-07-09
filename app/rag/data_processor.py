@@ -96,3 +96,9 @@ def process_folder(folder_path: str) -> list[dict]:
             })
 
     return all_chunks
+
+
+if __name__ == "__main__":
+    path = "uploads\my_resume.pdf"
+
+    print(load_pdf(path=path))
