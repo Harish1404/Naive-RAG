@@ -6,9 +6,11 @@ litellm
 python-dotenv
 
 sentence-transformers
-chromadb
+pymongo
+motor
 pypdf
 ragas
+
 
 numpy
 

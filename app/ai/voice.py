@@ -9,6 +9,7 @@ async def speech_to_text(audio_path: str) -> str:
     """
     Converts speech from an audio file to text using Groq's whisper-large-v3-turbo model.
     """
+    
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found at: {audio_path}")
 

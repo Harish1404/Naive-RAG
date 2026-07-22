@@ -10,49 +10,54 @@ logger = logging.getLogger(__name__)
 class RAGPipeline:
     """
     Retrieval half of RAG: turns a folder of documents into a searchable
-    vector store, and turns a user question into the most relevant chunks.
-
-    Does NOT talk to any LLM — that part lives in ChatService, which asks
-    this pipeline for context and then generates the answer.
+    vector store backed by MongoDB Atlas, and turns a user question into the most relevant chunks.
     """
 
     def __init__(self):
         self.embedding_model = EmbeddingModel()
         self.vector_store = VectorStore()
 
-    def ingest(self, folder_path: str) -> int:
+    async def ingest(self, folder_path: str) -> int:
         """
-        Reads every document in `folder_path`, splits it into chunks,
-        embeds each chunk, and stores everything in the vector store.
+        Reads every document in `folder_path`, splits into chunks,
+        embeds ONLY NEW chunks, and stores them in MongoDB Atlas.
 
-        Returns the number of chunks ingested.
+        Returns the number of new chunks ingested.
         """
         chunks = process_folder(folder_path)
 
         if not chunks:
             logger.warning(f"No documents found to ingest in '{folder_path}'.")
-            self.vector_store.reset_collection()
             return 0
 
-        texts = [chunk["text"] for chunk in chunks]
+        existing_ids = await self.vector_store.get_existing_ids()
+        new_chunks = [chunk for chunk in chunks if chunk["id"] not in existing_ids]
+
+        if not new_chunks:
+            logger.info(f"All {len(chunks)} chunk(s) from '{folder_path}' already exist in MongoDB. Skipping re-ingestion.")
+            return 0
+
+        logger.info(f"Found {len(new_chunks)} new chunk(s) to embed out of {len(chunks)} total.")
+
+        texts = [chunk["text"] for chunk in new_chunks]
         embeddings = self.embedding_model.embed_texts(texts)
 
-        self.vector_store.reset_collection()
-        self.vector_store.add(
-            ids=[chunk["id"] for chunk in chunks],
+        await self.vector_store.add(
+            ids=[chunk["id"] for chunk in new_chunks],
             embeddings=embeddings,
             documents=texts,
-            metadatas=[{"source": chunk["source"]} for chunk in chunks],
+            metadatas=[{"source": chunk["source"]} for chunk in new_chunks],
         )
 
-        logger.info(f"Ingested {len(chunks)} chunk(s) from '{folder_path}'.")
-        return len(chunks)
+        logger.info(f"Successfully ingested {len(new_chunks)} new chunk(s) into MongoDB Atlas.")
+        return len(new_chunks)
 
-    def retrieve(self, query: str, top_k: int = 4) -> list[dict]:
+    async def retrieve(self, query: str, top_k: int = 4) -> list[dict]:
         """Returns the `top_k` chunks most relevant to the given query."""
         query_embedding = self.embedding_model.embed_query(query)
-        return self.vector_store.query(query_embedding, top_k=top_k)
+        return await self.vector_store.query(query_embedding, top_k=top_k)
 
 
 # One shared instance — loaded once, reused by every request.
 rag_pipeline = RAGPipeline()
+

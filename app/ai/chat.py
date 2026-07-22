@@ -37,17 +37,18 @@ class ChatService:
             ("gemini/gemini-2.5-flash",   self.gemini_key),
             ("groq/llama-3.1-8b-instant", self.groq_key),
         ]
+        self.messages = []
 
-        # RAG step: pull the most relevant chunks from the ingested documents
-        # (e.g. the resume) and hand them to the LLM alongside the question.
-        retrieved_chunks = rag_pipeline.retrieve(self.user_prompt)
+    async def prepare_messages(self):
+        # RAG step: pull the most relevant chunks from MongoDB Atlas
+        retrieved_chunks = await rag_pipeline.retrieve(self.user_prompt)
         context_message = build_context_message(self.user_prompt, retrieved_chunks)
 
-        # The message list that gets sent to the LLM
         self.messages = [
             {"role": "system", "content": RAG_SYSTEM_PROMPT},
             {"role": "user",   "content": context_message},
         ]
+
 
     async def stream_retry(self, model: str, api_key: str, messages: list, max_retries: int = 3, **kwargs):
         """
@@ -115,7 +116,11 @@ class ChatService:
         Tries each model in the fallback chain.
         Yields chunks from the first model that succeeds.
         """
+        if not self.messages:
+            await self.prepare_messages()
+
         for model_name, api_key in self.fallback_chain:
+
             try:
                 async for chunk in self.stream_retry(
                     model       = model_name,
@@ -130,6 +135,5 @@ class ChatService:
 
             except Exception as e:
                 logger.error(f"[{model_name}] Failed, trying next fallback... ({e})")
-
 
 
