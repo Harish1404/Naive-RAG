@@ -40,7 +40,7 @@ class RAGPipeline:
         logger.info(f"Found {len(new_chunks)} new chunk(s) to embed out of {len(chunks)} total.")
 
         texts = [chunk["text"] for chunk in new_chunks]
-        embeddings = self.embedding_model.embed_texts(texts)
+        embeddings = await self.embedding_model.embed_texts(texts)
 
         await self.vector_store.add(
             ids=[chunk["id"] for chunk in new_chunks],
@@ -53,9 +53,9 @@ class RAGPipeline:
         return len(new_chunks)
 
     async def retrieve(self, query: str, top_k: int = 4) -> list[dict]:
-        """Returns the `top_k` chunks most relevant to the given query."""
-        query_embedding = self.embedding_model.embed_query(query)
-        return await self.vector_store.query(query_embedding, top_k=top_k)
+        """Returns the `top_k` chunks most relevant to the given query, using hybrid search."""
+        query_embedding = await self.embedding_model.embed_query(query)
+        return await self.vector_store.hybrid_search(query_text=query, query_embedding=query_embedding, top_k=top_k)
 
 
 # One shared instance — loaded once, reused by every request.

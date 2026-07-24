@@ -5,14 +5,9 @@ litellm
 
 python-dotenv
 
-sentence-transformers
 pymongo
 motor
+
 pypdf
-ragas
 
-
-numpy
-
-rich
 

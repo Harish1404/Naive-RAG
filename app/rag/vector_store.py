@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pymongo import UpdateOne
 from app.db.mongodb import get_vector_collection
@@ -8,10 +9,13 @@ logger = logging.getLogger("uvicorn")
 class VectorStore:
     """
     Stores text chunks alongside their embeddings in MongoDB Atlas,
-    and performs vector search using Atlas Vector Search ($vectorSearch).
+    and performs hybrid search (vector search + keyword search) using
+    Atlas Vector Search ($vectorSearch) and Atlas Search ($search).
     """
 
     INDEX_NAME = "vector_index"
+    KEYWORD_INDEX_NAME = "keyword_index"
+    EMBEDDING_DIMENSIONS = 768
 
     def _get_collection(self):
         return get_vector_collection()
@@ -38,17 +42,21 @@ class VectorStore:
         try:
             collection = self._get_collection()
             cursor = collection.list_search_indexes()
+
             existing_indexes = await cursor.to_list(length=100)
             idx_names = [idx.get("name") for idx in existing_indexes]
+
             if self.INDEX_NAME not in idx_names:
+
                 from pymongo.operations import SearchIndexModel
+
                 index_model = SearchIndexModel(
                     definition={
                         "fields": [
                             {
                                 "type": "vector",
                                 "path": "embedding",
-                                "numDimensions": 384,
+                                "numDimensions": self.EMBEDDING_DIMENSIONS,
                                 "similarity": "cosine"
                             }
                         ]
@@ -58,6 +66,33 @@ class VectorStore:
                 )
                 await collection.create_search_index(model=index_model)
                 logger.info(f"✅ Automatically created Atlas Vector Search index '{self.INDEX_NAME}' on MongoDB Atlas.")
+                
+        except Exception as e:
+            logger.debug(f"Atlas Search index check note: {e}")
+
+    async def ensure_keyword_index(self):
+        """Automatically checks and creates the Atlas Search (keyword) index if missing."""
+        try:
+            collection = self._get_collection()
+            cursor = collection.list_search_indexes()
+            existing_indexes = await cursor.to_list(length=100)
+            idx_names = [idx.get("name") for idx in existing_indexes]
+            if self.KEYWORD_INDEX_NAME not in idx_names:
+                from pymongo.operations import SearchIndexModel
+                index_model = SearchIndexModel(
+                    definition={
+                        "mappings": {
+                            "dynamic": False,
+                            "fields": {
+                                "text": {"type": "string"}
+                            }
+                        }
+                    },
+                    name=self.KEYWORD_INDEX_NAME,
+                    type="search"
+                )
+                await collection.create_search_index(model=index_model)
+                logger.info(f"✅ Automatically created Atlas Search index '{self.KEYWORD_INDEX_NAME}' on MongoDB Atlas.")
         except Exception as e:
             logger.debug(f"Atlas Search index check note: {e}")
 
@@ -86,9 +121,10 @@ class VectorStore:
             result = await collection.bulk_write(operations)
             logger.info(f"MongoDB Vector Store updated: {result.upserted_count} inserted, {result.modified_count} modified.")
             await self.ensure_vector_index()
+            await self.ensure_keyword_index()
 
 
-    async def query(self, query_embedding: list[float], top_k: int = 4) -> list[dict]:
+    async def vector_search(self, query_embedding: list[float], top_k: int = 4) -> list[dict]:
         """Finds the `top_k` chunks most similar to the query embedding using MongoDB Atlas Vector Search."""
         collection = self._get_collection()
 
@@ -104,6 +140,7 @@ class VectorStore:
             },
             {
                 "$project": {
+                    "_id": 1,
                     "text": 1,
                     "source": 1,
                     "score": {"$meta": "vectorSearchScore"},
@@ -114,18 +151,110 @@ class VectorStore:
         try:
             cursor = collection.aggregate(pipeline)
             results = await cursor.to_list(length=top_k)
+
             matches = []
             for doc in results:
                 matches.append({
+                    "_id": doc.get("_id"),
                     "text": doc.get("text", ""),
                     "source": doc.get("source", "unknown"),
                     "score": doc.get("score", 0.0),
                     "distance": 1.0 - doc.get("score", 0.0),
                 })
+
             return matches
+
         except Exception as e:
             logger.warning(
                 f"MongoDB Vector Search query failed or 'vector_index' is not configured yet in Atlas UI: {e}"
             )
             return []
+
+    async def keyword_search(self, query_text: str, top_k: int = 4) -> list[dict]:
+        """Finds the `top_k` chunks whose text best matches `query_text` using MongoDB Atlas Search (keyword search)."""
+        collection = self._get_collection()
+
+        pipeline = [
+            {
+                "$search": {
+                    "index": self.KEYWORD_INDEX_NAME,
+                    "text": {
+                        "query": query_text,
+                        "path": "text",
+                    }
+                }
+            },
+            {"$limit": top_k},
+            {
+                "$project": {
+                    "_id": 1,
+                    "text": 1,
+                    "source": 1,
+                    "score": {"$meta": "searchScore"},
+                }
+            }
+        ]
+
+        try:
+            cursor = collection.aggregate(pipeline)
+            results = await cursor.to_list(length=top_k)
+            return [
+                {
+                    "_id": doc.get("_id"),
+                    "text": doc.get("text", ""),
+                    "source": doc.get("source", "unknown"),
+                    "score": doc.get("score", 0.0),
+                }
+                for doc in results
+            ]
+        except Exception as e:
+            logger.warning(
+                f"MongoDB Keyword Search query failed or 'keyword_index' is not configured yet in Atlas UI: {e}"
+            )
+            return []
+
+    def _reciprocal_rank_fusion(self, result_lists: list[list[dict]], k: int = 60) -> list[dict]:
+        """
+        Combines several ranked result lists into one, using Reciprocal Rank Fusion (RRF).
+
+        Vector search scores (cosine similarity) and keyword search scores (BM25-style)
+        are on different scales, so we can't just compare them directly. Instead, RRF
+        looks at each chunk's *rank position* (1st, 2nd, 3rd...) in every list it appears in:
+
+            fused_score(chunk) = sum of 1 / (k + rank) across every list it appears in
+
+        A chunk found near the top of either list gets a high fused score. A chunk found
+        in BOTH lists gets boosted even higher. This also gives us deduplication for free,
+        since each chunk id only appears once in the fused result.
+        """
+        fused_scores: dict[str, float] = {}
+        chunk_by_id: dict[str, dict] = {}
+
+        for results in result_lists:
+            for rank, chunk in enumerate(results, start=1):
+                chunk_id = chunk["_id"]
+                fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+                chunk_by_id.setdefault(chunk_id, chunk)  # keep the first-seen copy for text/source
+
+        ranked_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)
+        return [
+            {**chunk_by_id[chunk_id], "score": fused_scores[chunk_id]}
+            for chunk_id in ranked_ids
+        ]
+
+    async def hybrid_search(self, query_text: str, query_embedding: list[float], top_k: int = 4) -> list[dict]:
+        """
+        Hybrid search: retrieves candidates from vector search AND keyword search in
+        parallel, fuses the two ranked lists with Reciprocal Rank Fusion, and returns
+        the best `top_k` chunks overall.
+        """
+        fetch_k = top_k * 5  # pull a bigger candidate pool from each ranker so RRF has enough to work with
+
+        vector_results, keyword_results = await asyncio.gather(
+            self.vector_search(query_embedding, top_k=fetch_k),
+            self.keyword_search(query_text, top_k=fetch_k),
+        )
+
+        fused_results = self._reciprocal_rank_fusion([vector_results, keyword_results])
+        return fused_results[:top_k]
 

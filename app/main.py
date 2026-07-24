@@ -5,8 +5,13 @@ from fastapi import FastAPI
 from app.routes.chatbot import router as chatbot_router
 from app.rag.rag_pipeline import rag_pipeline
 from app.db.mongodb import connect_to_mongo, close_mongo_connection
+# Configure logging to output INFO level logs to terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
