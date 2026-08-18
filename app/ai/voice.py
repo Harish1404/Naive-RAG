@@ -1,13 +1,15 @@
 import os
 import asyncio
 import litellm
-from litellm import completion
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
 import edge_tts
 from app.core.config import settings
 
 async def speech_to_text(audio_path: str) -> str:
     """
-    Converts speech from an audio file to text using Groq's whisper-large-v3-turbo model.
+    Converts speech from an audio file to text using Groq's whisper-large-v3-turbo model,
+    then summarizes it using LangChain ChatGoogleGenerativeAI.
     """
     
     if not os.path.exists(audio_path):
@@ -21,14 +23,17 @@ async def speech_to_text(audio_path: str) -> str:
             api_key=settings.groq_api_key
         )
     
-    response = completion(
-        model='gemini/gemini-2.5-flash',
-        messages= [
-            {"role": "system", "content": "summarize the text short and crisp"},
-            {"role": "user", "content": output.text}
-        ]
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=settings.GEMINI_API_KEY,
     )
-    return response.choices[0].message.content
+    messages = [
+        SystemMessage(content="summarize the text short and crisp"),
+        HumanMessage(content=output.text)
+    ]
+    response = await llm.ainvoke(messages)
+    return response.content
+
 
 async def text_to_speech(text: str, output_path: str, voice: str = 'en-IN-PrabhatNeural') -> None:
     """

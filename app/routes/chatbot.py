@@ -1,21 +1,19 @@
 from fastapi import APIRouter
-from app.ai.chat import ChatService
 from fastapi.responses import StreamingResponse
+
+from app.ai.chat import ChatService
+from app.mcp import client as mcp_client
 
 router = APIRouter(tags=["Chatbot"])
 
+
 @router.post("/chatbot")
-async def chatbot(model_type: str, user_prompt: str):
-    service = ChatService(model_type=model_type, user_prompt=user_prompt)
+async def chatbot(user_prompt: str):
+    tools = mcp_client.get_tools()
+    service = ChatService(user_prompt=user_prompt, tools=tools)
 
-    stream_generator = service.chat()
-
-    # Wrap the generator in FastAPI's StreamingResponse
     return StreamingResponse(
-        stream_generator,      # The async generator that yields text chunks
-        media_type="text/event-stream",  #SSE(Server Sent Events) format
+        service.chat(),
+        media_type="text/event-stream",
         status_code=200,
     )
-
-
-

@@ -1,7 +1,15 @@
 fastapi
 uvicorn
 
-litellm
+langchain
+langchain-community
+langchain-core
+langchain-mistralai
+langchain-google-genai
+langchain-groq
+langchain-mcp-adapters
+langgraph
+
 
 python-dotenv
 

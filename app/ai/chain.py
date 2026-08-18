@@ -1,10 +1,10 @@
 import json                          # needed to parse JSON from Stage 1 output
 import logging
-import asyncio
-import random
 
-from litellm import acompletion, stream_chunk_builder
-from litellm.exceptions import RateLimitError, APIError
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_mistralai import ChatMistralAI
+from langchain_groq import ChatGroq
 
 from app.prompts.chain_prompts import STAGE_1_EXTRACT, STAGE_2_ENRICH, STAGE_3_FORMAT
 from app.core.config import settings
@@ -15,57 +15,78 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────
-# SECTION 2: Helper — Non-streaming LLM call
+# SECTION 2: Helper — Non-streaming LLM call with LangChain
 # ─────────────────────────────────────────────────────────
+
+def create_non_streaming_chain(temperature: float = 0.3):
+    """
+    Builds a LangChain Runnable for non-streaming calls with automatic fallbacks.
+    """
+    candidate_models = []
+
+    if settings.GEMINI_API_KEY:
+        candidate_models.append(
+            ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                google_api_key=settings.GEMINI_API_KEY,
+                temperature=temperature,
+                max_retries=2,
+            )
+        )
+
+    if settings.GROQ_API_KEY:
+        candidate_models.append(
+            ChatGroq(
+                model="llama-3.1-8b-instant",
+                groq_api_key=settings.GROQ_API_KEY,
+                temperature=temperature,
+                max_retries=2,
+            )
+        )
+
+    if settings.MISTRAL_API_KEY:
+        candidate_models.append(
+            ChatMistralAI(
+                model="mistral-large-2407",
+                api_key=settings.MISTRAL_API_KEY,
+                temperature=temperature,
+                max_retries=2,
+            )
+        )
+
+    if not candidate_models:
+        raise ValueError("No valid API keys configured for Gemini, Groq, or Mistral.")
+
+    primary_model = candidate_models[0]
+    fallback_models = candidate_models[1:]
+
+    if fallback_models:
+        return primary_model.with_fallbacks(fallbacks=fallback_models)
+    return primary_model
+
 
 async def call_llm_without_streaming(messages: list) -> str:
     """
-    Calls the LLM and WAITS for the complete reply before returning.
-
-    Why no streaming here?
-    Chaining requires the FULL output of one stage before the next stage can start.
-    (e.g. Stage 1 returns JSON — we can't parse half a JSON string)
-
-    Returns the full reply as a plain string.
+    Calls the LLM using LangChain and WAITS for the complete reply before returning.
+    Supports automatic fallback across Gemini, Groq, and Mistral.
     """
+    chain = create_non_streaming_chain(temperature=0.3)
 
-    gemini_key = settings.gemini_api_key
-    groq_key   = settings.groq_api_key
+    formatted_messages = []
+    for msg in messages:
+        if isinstance(msg, BaseMessage):
+            formatted_messages.append(msg)
+        elif isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "system":
+                formatted_messages.append(SystemMessage(content=content))
+            else:
+                formatted_messages.append(HumanMessage(content=content))
 
-    # Try Gemini first, fall back to Groq if it fails
-    fallback_chain = [
-        ("gemini/gemini-2.5-flash",   gemini_key),
-        ("groq/llama-3.1-8b-instant", groq_key),
-    ]
+    response = await chain.ainvoke(formatted_messages)
+    return response.content
 
-    last_error = None
-
-    for model_name, api_key in fallback_chain:
-        if not api_key:
-            continue  # skip if this API key is not configured
-
-        try:
-            logger.info(f"Calling model (non-streaming): {model_name}")
-
-            # stream=False means we wait for the entire response before continuing
-            response = await acompletion(
-                model       = model_name,
-                api_key     = api_key,
-                messages    = messages,
-                temperature = 0.3,   # lower temperature = more factual, less creative
-                stream      = False
-            )
-
-            # Extract the text content from the response object
-            return response["choices"][0]["message"]["content"]
-
-        except Exception as e:
-            logger.warning(f"[{model_name}] Failed in non-streaming call: {e}. Trying fallback...")
-            last_error = e
-            continue
-
-    # If we reach here, all models failed
-    raise Exception(f"All models failed in non-streaming call. Last error: {last_error}")
 
 
 # ─────────────────────────────────────────────────────────

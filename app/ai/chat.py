@@ -1,139 +1,118 @@
 import logging
-import asyncio
-import random
+from typing import AsyncGenerator
 
-from litellm import acompletion, stream_chunk_builder
-from litellm.exceptions import RateLimitError, APIError
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_mistralai import ChatMistralAI
+from langchain_groq import ChatGroq
+from langgraph.prebuilt import create_react_agent
 
-from app.prompts.rag_prompt import RAG_SYSTEM_PROMPT, build_context_message
 from app.core.config import settings
-from app.rag.rag_pipeline import rag_pipeline
 
-
-# logger lets us print debug/error messages to the console with proper labels
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────
-# SECTION 1: ChatService  (streaming chat — already built)
+# LLM factory with automatic fallback chain
 # ─────────────────────────────────────────────────────────
+
+def create_llm_with_fallbacks(temperature: float = 0.7, max_tokens: int = 1024):
+    """
+    Builds a LangChain chat model with built-in fallbacks.
+    Priority: Mistral -> Gemini -> Groq.
+    """
+    candidate_models = []
+
+    if settings.MISTRAL_API_KEY:
+        candidate_models.append(
+            ChatMistralAI(
+                model="mistral-large-2407",
+                api_key=settings.MISTRAL_API_KEY,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=2,
+            )
+        )
+
+    if settings.GEMINI_API_KEY:
+        candidate_models.append(
+            ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                google_api_key=settings.GEMINI_API_KEY,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                max_retries=2,
+            )
+        )
+
+    if settings.GROQ_API_KEY:
+        candidate_models.append(
+            ChatGroq(
+                model="llama-3.1-8b-instant",
+                groq_api_key=settings.GROQ_API_KEY,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=2,
+            )
+        )
+
+    if not candidate_models:
+        raise ValueError("No valid API keys configured for Mistral, Gemini, or Groq.")
+
+    primary = candidate_models[0]
+    fallbacks = candidate_models[1:]
+
+    if fallbacks:
+        return primary.with_fallbacks(fallbacks=fallbacks)
+    return primary
+
+
+# ─────────────────────────────────────────────────────────
+# ChatService — MCP-powered ReAct agent with streaming
+# ─────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a helpful AI assistant with access to GitHub tools.
+When the user asks about GitHub repositories, issues, pull requests, or code,
+use the available tools to fetch real data. For general questions, answer directly.
+Be concise and helpful."""
+
 
 class ChatService:
     """
-    Handles a single user chat message.
-    Streams the reply back token-by-token using LiteLLM.
-    Falls back to a second model if the first one fails.
+    Handles user chat messages using a LangGraph ReAct agent.
+    The agent has access to MCP tools (GitHub) and can decide
+    whether to call tools or respond directly.
     """
 
-    def __init__(self, model_type: str, user_prompt: str):
-
+    def __init__(self, user_prompt: str, tools: list):
         self.user_prompt = user_prompt
+        self.tools = tools
 
-        self.gemini_key = settings.gemini_api_key
-        self.groq_key   = settings.groq_api_key
+        llm = create_llm_with_fallbacks()
+        self.agent = create_react_agent(model=llm, tools=self.tools)
 
-        # We always try Gemini first, then fall back to Groq
-        self.fallback_chain = [
-            ("gemini/gemini-2.5-flash",   self.gemini_key),
-            ("groq/llama-3.1-8b-instant", self.groq_key),
-        ]
-        self.messages = []
-
-    async def prepare_messages(self):
-        # RAG step: pull the most relevant chunks from MongoDB Atlas
-        retrieved_chunks = await rag_pipeline.retrieve(self.user_prompt)
-        context_message = build_context_message(self.user_prompt, retrieved_chunks)
-
-        self.messages = [
-            {"role": "system", "content": RAG_SYSTEM_PROMPT},
-            {"role": "user",   "content": context_message},
-        ]
-
-
-    async def stream_retry(self, model: str, api_key: str, messages: list, max_retries: int = 3, **kwargs):
+    async def chat(self) -> AsyncGenerator[str, None]:
         """
-        Tries to stream a response from the given model.
-        If we hit a rate limit, it waits and retries (up to max_retries times).
-        Yields text chunks as they arrive so the user sees output in real time.
+        Streams response tokens from the ReAct agent.
+        Uses astream_events to capture only the final LLM text output.
         """
+        input_messages = {
+            "messages": [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=self.user_prompt),
+            ]
+        }
 
-        for attempt in range(1, max_retries + 1):
+        try:
+            async for event in self.agent.astream_events(input_messages, version="v2"):
+                kind = event.get("event")
 
-            try:
-                # Call the LLM with streaming enabled
-                response = await acompletion(
-                    model       = model,
-                    api_key     = api_key,
-                    messages    = messages,
-                    temperature = kwargs.get("temperature", 0.7),
-                    max_tokens  = kwargs.get("max_tokens", 500),
-                    stream      = True
-                )
+                # Only yield text chunks from the chat model stream
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        yield chunk.content
 
-                collected_chunks = []
-
-                try:
-                    # Loop over every chunk that arrives from the LLM
-                    async for chunk in response:
-                        collected_chunks.append(chunk)
-
-                        choices = getattr(chunk, "choices", [])
-                        if choices:
-                            delta_content = getattr(choices[0].delta, "content", "")
-                            if delta_content:
-                                yield delta_content   # send this piece to the caller
-
-                    return  # streaming finished successfully — stop retrying
-
-                except Exception as stream_err:
-                    logger.error(f"[{model}] Stream interrupted: {stream_err}")
-                    yield f"\n[ERROR: Stream interrupted — {stream_err}]"
-
-                finally:
-                    # Rebuild the full response object for logging (runs whether or not there was an error)
-                    if collected_chunks:
-                        try:
-                            stream_chunk_builder(collected_chunks)
-                        except Exception:
-                            pass
-
-            except RateLimitError as e:
-                logger.warning(f"[{model}] Rate limited — attempt {attempt}/{max_retries}")
-
-                # Respect the Retry-After header if the API gives us one
-                headers         = getattr(e, "headers", {}) or {}
-                retry_after     = headers.get("Retry-After") or headers.get("retry-after")
-                wait            = float(retry_after) if retry_after else (2 ** attempt) + random.uniform(0.1, 1.0)
-
-                await asyncio.sleep(wait)
-
-            except APIError as e:
-                logger.error(f"[{model}] Non-retryable API error: {e}")
-                raise e
-
-    async def chat(self):
-        """
-        Tries each model in the fallback chain.
-        Yields chunks from the first model that succeeds.
-        """
-        if not self.messages:
-            await self.prepare_messages()
-
-        for model_name, api_key in self.fallback_chain:
-
-            try:
-                async for chunk in self.stream_retry(
-                    model       = model_name,
-                    api_key     = api_key,
-                    messages    = self.messages,
-                    temperature = 0.7,
-                    max_tokens  = 500,
-                ):
-                    yield chunk
-
-                return  # success — don't try the next model
-
-            except Exception as e:
-                logger.error(f"[{model_name}] Failed, trying next fallback... ({e})")
-
-
+        except Exception as e:
+            logger.error(f"Agent execution error: {e}")
+            yield f"\n[ERROR: Agent failed — {str(e)}]"
